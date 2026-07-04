@@ -158,7 +158,11 @@ func main() {
 		serverboot.Fatal(ctx, "JWT auth mode requires a Kubernetes ServiceAccount issuer discovery client", fmt.Errorf("client JWT issuer %q is not usable for discovery", *clientJWTIssuer))
 	}
 
-	sessionIdentitySrv := sessionidentity.New(*clientJWTIssuer, *clientJWTAudience, *sessionIDJWTPoolFile, *sessionIDCAPoolFile, *workerpoolCACerts, jwtIssuerDiscoveryClient)
+	// One verifier shared by the auth interceptor and the session-identity
+	// service, so they share the issuer's cached verification keys.
+	jwtVerifier := k8sjwt.NewVerifier(jwtIssuerDiscoveryClient)
+
+	sessionIdentitySrv := sessionidentity.New(*clientJWTIssuer, *clientJWTAudience, *sessionIDJWTPoolFile, *sessionIDCAPoolFile, *workerpoolCACerts, jwtVerifier)
 
 	lisCfg := &net.ListenConfig{}
 	lis, err := lisCfg.Listen(ctx, "tcp", *listenAddr)
@@ -169,7 +173,7 @@ func main() {
 	authCfg := ateapiauth.ServerConfig{
 		Mode: authModeParsed,
 		VerifyBearerToken: func(ctx context.Context, bearer string) error {
-			_, err := k8sjwt.Verify(ctx, jwtIssuerDiscoveryClient, bearer, *clientJWTIssuer, *clientJWTAudience, time.Now())
+			_, err := jwtVerifier.Verify(ctx, bearer, *clientJWTIssuer, *clientJWTAudience, time.Now())
 			return err
 		},
 	}
