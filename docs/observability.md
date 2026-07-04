@@ -100,6 +100,9 @@ Agent Substrate emits foundational OpenTelemetry system and server metrics to mo
 | `rpc.server.call.duration` | ateapi & atelet (gRPC servers, via `otelgrpc`) | histogram | per-method gRPC latency, request rate, and errors (labels `rpc.method`, `rpc.response.status_code`) |
 | `atenet.router.route.duration` | atenet-router | histogram | Substrate E2E — Envoy receiving a request to Envoy forwarding it to the resolved worker, excluding actor compute and the response |
 | `atelet.snapshot.size` | atelet | histogram | uncompressed size in bytes of each gVisor snapshot image written during checkpoint (labels `kind`, `actor_template_name`) |
+| `ateapi.workercache.workers` | ateapi | gauge | number of workers currently tracked by the in-memory worker cache |
+| `ateapi.workercache.resyncs` | ateapi | counter | times the worker cache lost its watch and rebuilt state from a full relist |
+| `ateapi.store.worker_event.publish_failures` | ateapi | counter | worker-change events that failed to publish to the store's pub/sub channel; watchers only recover via periodic relist, so a non-zero rate means they run stale in between |
 
 The table lists the OpenTelemetry instrument names. How a name appears in a query depends on the backend (Cloud Monitoring (GMP) / Kind collector).
 

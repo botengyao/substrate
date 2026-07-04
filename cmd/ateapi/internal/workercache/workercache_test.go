@@ -26,6 +26,9 @@ import (
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+	"go.opentelemetry.io/otel"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"google.golang.org/protobuf/testing/protocmp"
 	"k8s.io/apimachinery/pkg/util/wait"
 )
@@ -351,6 +354,98 @@ func TestCache_Relist_FailureIsNonFatal(t *testing.T) {
 	if diff := cmp.Diff([]*ateapipb.Worker{w1}, workers, protocmp.Transform(), workerSortOpt); diff != "" {
 		t.Errorf("workers mismatch (-want +got):\n%s", diff)
 	}
+}
+
+func TestCache_Metrics(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	prev := otel.GetMeterProvider()
+	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)))
+	t.Cleanup(func() { otel.SetMeterProvider(prev) })
+
+	w1 := makeWorker("ns", "pod1", 1)
+	w2 := makeWorker("ns", "pod2", 1)
+	fs := newFakeStore(w1, w2)
+	c := workercache.New(fs, time.Hour)
+	ctx, cancel := context.WithCancel(t.Context())
+
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	if got := gaugeValue(t, reader, "ateapi.workercache.workers"); got != 2 {
+		t.Errorf("workers gauge after start = %d, want 2", got)
+	}
+	if got := counterValue(t, reader, "ateapi.workercache.resyncs"); got != 0 {
+		t.Errorf("resyncs counter after start = %d, want 0", got)
+	}
+
+	// Disconnect with a smaller snapshot: the resync counter should tick and
+	// the gauge should track the new size.
+	fs.setWorkers(w1)
+	fs.disconnect()
+	eventually(t, func() bool {
+		workers, err := c.Workers()
+		return err == nil && len(workers) == 1
+	}, 2*time.Second)
+
+	if got := counterValue(t, reader, "ateapi.workercache.resyncs"); got != 1 {
+		t.Errorf("resyncs counter after disconnect = %d, want 1", got)
+	}
+	if got := gaugeValue(t, reader, "ateapi.workercache.workers"); got != 1 {
+		t.Errorf("workers gauge after resync = %d, want 1", got)
+	}
+
+	// Shutdown unregisters the gauge callback, so the gauge stops reporting.
+	cancel()
+	eventually(t, func() bool {
+		_, ok := metricByName(t, reader, "ateapi.workercache.workers")
+		return !ok
+	}, 2*time.Second)
+}
+
+// metricByName collects from reader and returns the named metric, if reported.
+func metricByName(t *testing.T, reader *sdkmetric.ManualReader, name string) (metricdata.Metrics, bool) {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name == name {
+				return m, true
+			}
+		}
+	}
+	return metricdata.Metrics{}, false
+}
+
+func gaugeValue(t *testing.T, reader *sdkmetric.ManualReader, name string) int64 {
+	t.Helper()
+	m, ok := metricByName(t, reader, name)
+	if !ok {
+		t.Fatalf("gauge %q not reported", name)
+	}
+	gauge, ok := m.Data.(metricdata.Gauge[int64])
+	if !ok || len(gauge.DataPoints) != 1 {
+		t.Fatalf("gauge %q has unexpected data: %#v", name, m.Data)
+	}
+	return gauge.DataPoints[0].Value
+}
+
+// counterValue returns the named counter's value; a counter with no
+// recordings yet is not reported at all, which counts as 0.
+func counterValue(t *testing.T, reader *sdkmetric.ManualReader, name string) int64 {
+	t.Helper()
+	m, ok := metricByName(t, reader, name)
+	if !ok {
+		return 0
+	}
+	sum, ok := m.Data.(metricdata.Sum[int64])
+	if !ok || len(sum.DataPoints) != 1 {
+		t.Fatalf("counter %q has unexpected data: %#v", name, m.Data)
+	}
+	return sum.DataPoints[0].Value
 }
 
 type fakeStore struct {

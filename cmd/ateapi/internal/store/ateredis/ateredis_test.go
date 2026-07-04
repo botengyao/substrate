@@ -24,6 +24,9 @@ import (
 	"github.com/alicebob/miniredis/v2"
 	"github.com/google/go-cmp/cmp"
 	"github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/otel"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/testing/protocmp"
 
@@ -1097,4 +1100,59 @@ func TestDeleteAtespace_EmptyWhileOtherAtespaceNonEmpty(t *testing.T) {
 	if err := s.DeleteAtespace(ctx, "team-b"); !errors.Is(err, store.ErrFailedPrecondition) {
 		t.Errorf("DeleteAtespace(team-b, non-empty) = %v, want ErrFailedPrecondition", err)
 	}
+}
+
+func TestPublishWorkerEvent_FailureCounted(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	prev := otel.GetMeterProvider()
+	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)))
+	t.Cleanup(func() { otel.SetMeterProvider(prev) })
+
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("failed to start miniredis: %v", err)
+	}
+	rdb := redis.NewClusterClient(&redis.ClusterOptions{
+		Addrs: []string{mr.Addr()},
+	})
+	s := NewPersistence(rdb)
+	ctx := context.Background()
+	worker := &ateapipb.Worker{WorkerNamespace: "ns", WorkerPod: "pod1"}
+
+	// A successful publish must not count as a failure.
+	s.publishWorkerEvent(ctx, store.WorkerEventCreated, worker)
+	if got := publishFailureCount(t, reader); got != 0 {
+		t.Errorf("publish failures after successful publish = %d, want 0", got)
+	}
+
+	// With the backend gone, the lost event must be counted.
+	mr.Close()
+	s.publishWorkerEvent(ctx, store.WorkerEventCreated, worker)
+	if got := publishFailureCount(t, reader); got != 1 {
+		t.Errorf("publish failures after backend loss = %d, want 1", got)
+	}
+}
+
+// publishFailureCount collects from reader and returns the publish-failure
+// counter's value; a counter with no recordings yet is not reported, which
+// counts as 0.
+func publishFailureCount(t *testing.T, reader *sdkmetric.ManualReader) int64 {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "ateapi.store.worker_event.publish_failures" {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			if !ok || len(sum.DataPoints) != 1 {
+				t.Fatalf("counter has unexpected data: %#v", m.Data)
+			}
+			return sum.DataPoints[0].Value
+		}
+	}
+	return 0
 }

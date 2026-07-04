@@ -28,13 +28,12 @@ import (
 
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/metric"
 	"k8s.io/apimachinery/pkg/util/wait"
 )
 
 // Cache maintains an in-memory snapshot of all workers.
-//
-// TODO: add metrics — at minimum a gauge for worker count, a counter for
-// resync events, and a counter for failed PUBLISH operations (in ateredis).
 type Cache struct {
 	store          store.Interface
 	relistInterval time.Duration
@@ -43,6 +42,9 @@ type Cache struct {
 	workers map[string]*ateapipb.Worker
 
 	ready atomic.Bool
+
+	resyncs      metric.Int64Counter
+	workersGauge metric.Registration
 }
 
 // New creates a Cache backed by a given store. relistInterval controls how
@@ -64,8 +66,44 @@ func (c *Cache) Start(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if err := c.initMetrics(); err != nil {
+		watch.Close()
+		return err
+	}
 	c.ready.Store(true)
 	go c.watchEvents(ctx, watch)
+	return nil
+}
+
+// initMetrics registers the cache's instruments on the global meter provider.
+func (c *Cache) initMetrics() error {
+	meter := otel.Meter("ateapi")
+	var err error
+	c.resyncs, err = meter.Int64Counter(
+		"ateapi.workercache.resyncs",
+		metric.WithUnit("{resync}"),
+		metric.WithDescription("Number of times the worker cache lost its watch and rebuilt state from a full relist."),
+	)
+	if err != nil {
+		return fmt.Errorf("create ateapi.workercache.resyncs counter: %w", err)
+	}
+	workers, err := meter.Int64ObservableGauge(
+		"ateapi.workercache.workers",
+		metric.WithUnit("{worker}"),
+		metric.WithDescription("Number of workers currently tracked by the in-memory worker cache."),
+	)
+	if err != nil {
+		return fmt.Errorf("create ateapi.workercache.workers gauge: %w", err)
+	}
+	c.workersGauge, err = meter.RegisterCallback(func(_ context.Context, o metric.Observer) error {
+		c.mu.RLock()
+		defer c.mu.RUnlock()
+		o.ObserveInt64(workers, int64(len(c.workers)))
+		return nil
+	}, workers)
+	if err != nil {
+		return fmt.Errorf("register ateapi.workercache.workers callback: %w", err)
+	}
 	return nil
 }
 
@@ -115,6 +153,9 @@ func (c *Cache) relist(ctx context.Context) error {
 }
 
 func (c *Cache) watchEvents(ctx context.Context, watch *store.WorkerWatch) {
+	// The gauge callback observes this cache's contents; drop it once the
+	// cache stops updating so a dead cache can't report stale counts.
+	defer func() { _ = c.workersGauge.Unregister() }()
 	ticker := time.NewTicker(c.relistInterval)
 	defer ticker.Stop()
 	for {
@@ -127,6 +168,7 @@ func (c *Cache) watchEvents(ctx context.Context, watch *store.WorkerWatch) {
 					return
 				}
 				slog.WarnContext(ctx, "worker cache: watch channel closed, resyncing")
+				c.resyncs.Add(ctx, 1)
 				watch = c.resync(ctx)
 				if watch == nil {
 					return // context cancelled

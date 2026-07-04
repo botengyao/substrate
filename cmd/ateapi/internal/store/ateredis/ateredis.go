@@ -56,6 +56,8 @@ import (
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/metric"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 )
@@ -75,14 +77,31 @@ type redisClient interface {
 // Persistence is a service that stores information about applications in Redis.
 type Persistence struct {
 	rdb redisClient
+
+	// workerPublishFailures counts worker-change events that never reached the
+	// pub/sub channel. Subscribers only recover these through the worker
+	// cache's periodic relist, so a non-zero rate means watchers are running
+	// stale. Nil when metrics are unavailable (e.g. tests constructing
+	// Persistence directly).
+	workerPublishFailures metric.Int64Counter
 }
 
 var _ store.Interface = (*Persistence)(nil)
 
 // NewPersistence creates a new Persistence.
 func NewPersistence(redisClient *redis.ClusterClient) *Persistence {
+	workerPublishFailures, err := otel.Meter("ateapi").Int64Counter(
+		"ateapi.store.worker_event.publish_failures",
+		metric.WithUnit("{event}"),
+		metric.WithDescription("Number of worker-change events that failed to publish to the store's pub/sub channel."),
+	)
+	if err != nil {
+		// Losing a counter is not worth failing the store over.
+		slog.Warn("Failed to create worker publish failure counter", slog.Any("err", err))
+	}
 	return &Persistence{
-		rdb: redisClient,
+		rdb:                   redisClient,
+		workerPublishFailures: workerPublishFailures,
 	}
 }
 
@@ -244,10 +263,18 @@ func (s *Persistence) publishWorkerEvent(ctx context.Context, eventType store.Wo
 	payload, err := marshalWorkerEvent(eventType, worker)
 	if err != nil {
 		slog.ErrorContext(ctx, "worker event marshal failed", slog.Any("err", err))
+		s.countPublishFailure(ctx)
 		return
 	}
 	if err := s.rdb.Publish(ctx, workerPubSubChannel, payload).Err(); err != nil {
 		slog.ErrorContext(ctx, "worker event publish failed", slog.Any("err", err))
+		s.countPublishFailure(ctx)
+	}
+}
+
+func (s *Persistence) countPublishFailure(ctx context.Context) {
+	if s.workerPublishFailures != nil {
+		s.workerPublishFailures.Add(ctx, 1)
 	}
 }
 
