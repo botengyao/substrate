@@ -124,10 +124,20 @@ var (
 // request just by minting tokens with bogus keyIDs.
 const keyRefetchInterval = 10 * time.Second
 
+// keyMaxAge is how long cached keys are used before a background refresh.
+// Unknown-keyID refetches only pick up keys ADDED to the issuer's JWKS;
+// without a periodic refresh, a key REMOVED from the JWKS (revoked) would be
+// trusted until process restart, because tokens signed by it keep hitting the
+// cache. keyMaxAge bounds that exposure. Refreshes are asynchronous: requests
+// are served from the current cache while the fetch runs, so this adds no
+// latency to any request.
+const keyMaxAge = 5 * time.Minute
+
 // CachedVerifier verifies Kubernetes JWTs, caching each issuer's verification
-// keys in memory. Keys are fetched on first use and refetched only when a JWT
-// presents an unknown keyID (i.e. on key rotation), rate-limited to one
-// fetch per issuer per keyRefetchInterval.
+// keys in memory. Keys are fetched on first use, refetched synchronously when
+// a JWT presents an unknown keyID (i.e. on key rotation, rate-limited to one
+// fetch per issuer per keyRefetchInterval), and refreshed in the background
+// once cached keys are older than keyMaxAge (so revoked keys age out).
 type CachedVerifier struct {
 	httpClient *http.Client
 
@@ -146,6 +156,9 @@ type CachedVerifier struct {
 type issuerKeys struct {
 	keys      []*KeyAndID
 	lastFetch time.Time
+	// refreshing is true while a background max-age refresh is in flight,
+	// so cache hits don't spawn one goroutine each until it completes.
+	refreshing bool
 }
 
 // NewCachedVerifier creates a CachedVerifier. httpClient is used for OIDC
@@ -170,7 +183,16 @@ func (v *CachedVerifier) keyForIssuer(ctx context.Context, issuer, keyID string,
 		v.issuers[issuer] = state
 	}
 	if key := findKey(state.keys, keyID); key != nil {
+		// Serve from cache, but refresh in the background once the keys pass
+		// keyMaxAge so removed (revoked) keys age out; see keyMaxAge.
+		startRefresh := now.Sub(state.lastFetch) > keyMaxAge && !state.refreshing
+		if startRefresh {
+			state.refreshing = true
+		}
 		v.mu.Unlock()
+		if startRefresh {
+			go v.refreshIssuerKeys(issuer, state, now)
+		}
 		return key.PublicKey, nil
 	}
 	lastFetch := state.lastFetch
@@ -203,6 +225,38 @@ func (v *CachedVerifier) keyForIssuer(ctx context.Context, issuer, keyID string,
 		return nil, fmt.Errorf("unknown keyID %q", keyID)
 	}
 	return key.PublicKey, nil
+}
+
+// refreshIssuerKeys refetches an issuer's keys, replacing the cached set on
+// success and keeping the previous keys on failure (a transient discovery
+// outage must not take down verification). Runs off the request path; the
+// caller must have set state.refreshing under the lock.
+func (v *CachedVerifier) refreshIssuerKeys(issuer string, state *issuerKeys, now time.Time) {
+	_, err, _ := v.flight.Do(issuer, func() (any, error) {
+		// context.Background(): this outlives the request that noticed the
+		// stale keys; the HTTP client's own timeout bounds the fetch.
+		keys, err := discoverKeysForIssuer(context.Background(), v.httpClient, issuer)
+		v.mu.Lock()
+		defer v.mu.Unlock()
+		// Whether or not the fetch succeeded, don't try again for another
+		// interval, so a failing issuer isn't hammered.
+		state.lastFetch = now
+		if err != nil {
+			return nil, err
+		}
+		state.keys = keys
+		return nil, nil
+	})
+	// Reset refreshing outside the closure: flight.Do coalesces with the
+	// unknown-keyID fetch path, so our closure may never run — the flag must
+	// clear whenever the shared flight completes.
+	v.mu.Lock()
+	state.refreshing = false
+	v.mu.Unlock()
+	if err != nil {
+		slog.Warn("Background refresh of issuer keys failed; keeping previous keys",
+			slog.String("issuer", issuer), slog.Any("err", err))
+	}
 }
 
 func findKey(keys []*KeyAndID, keyID string) *KeyAndID {

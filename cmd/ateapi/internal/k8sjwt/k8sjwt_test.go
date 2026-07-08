@@ -62,14 +62,23 @@ func newFakeIssuer(t *testing.T) *fakeIssuer {
 	return f
 }
 
-// setKeys replaces the JWKS content, simulating key rotation.
+// setKeys replaces the JWKS content, simulating key rotation. Keys are named
+// keyID(0), keyID(1), ...
 func (f *fakeIssuer) setKeys(t *testing.T, keys ...*rsa.PrivateKey) {
+	t.Helper()
+	f.setKeysWithOffset(t, 0, keys...)
+}
+
+// setKeysWithOffset is setKeys with key names starting at keyID(offset),
+// so a test can serve a JWKS from which earlier keyIDs have been removed
+// (simulating revocation).
+func (f *fakeIssuer) setKeysWithOffset(t *testing.T, offset int, keys ...*rsa.PrivateKey) {
 	t.Helper()
 	var jwks []jwkT
 	for i, k := range keys {
 		jwks = append(jwks, jwkT{
 			KeyType: "RSA",
-			KeyID:   keyID(i),
+			KeyID:   keyID(offset + i),
 			RSAN:    base64.RawURLEncoding.EncodeToString(k.PublicKey.N.Bytes()),
 			RSAE:    base64.RawURLEncoding.EncodeToString(big.NewInt(int64(k.PublicKey.E)).Bytes()),
 		})
@@ -218,6 +227,70 @@ func TestCachedVerifier_UnknownKeyIDRefetchIsThrottled(t *testing.T) {
 	}
 	if got := issuer.fetches.Load(); got != 2 {
 		t.Errorf("issuer fetched %d times after throttle window, want 2", got)
+	}
+}
+
+func TestCachedVerifier_BackgroundRefreshDropsRevokedKeys(t *testing.T) {
+	issuer := newFakeIssuer(t)
+	oldKey := generateKey(t)
+	issuer.setKeys(t, oldKey)
+	now := time.Now()
+
+	v := NewCachedVerifier(nil)
+	jwt := signJWT(t, oldKey, keyID(0), issuer.server.URL, testAudience, now)
+	if _, err := v.Verify(context.Background(), jwt, issuer.server.URL, testAudience, now); err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+
+	// Revoke key-0: the issuer's JWKS now only contains key-1. Tokens signed
+	// by key-0 still hit the cache, so nothing refetches until keyMaxAge.
+	newKey := generateKey(t)
+	issuer.setKeysWithOffset(t, 1, newKey)
+
+	// Within keyMaxAge the revoked key keeps verifying from cache, and no
+	// refresh is triggered.
+	if _, err := v.Verify(context.Background(), jwt, issuer.server.URL, testAudience, now.Add(time.Minute)); err != nil {
+		t.Fatalf("Verify within keyMaxAge: %v", err)
+	}
+	if got := issuer.fetches.Load(); got != 1 {
+		t.Fatalf("issuer fetched %d times within keyMaxAge, want 1", got)
+	}
+
+	// Past keyMaxAge, a hit still succeeds (stale-while-revalidate) but kicks
+	// off a background refresh.
+	stale := now.Add(keyMaxAge + time.Second)
+	if _, err := v.Verify(context.Background(), jwt, issuer.server.URL, testAudience, stale); err != nil {
+		t.Fatalf("Verify at expiry (should serve stale): %v", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for issuer.fetches.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := issuer.fetches.Load(); got != 2 {
+		t.Fatalf("issuer fetched %d times after keyMaxAge, want 2 (background refresh)", got)
+	}
+
+	// The refresh may still be applying the new key set; poll until the
+	// revoked key stops verifying.
+	rejected := false
+	for time.Now().Before(deadline) {
+		if _, err := v.Verify(context.Background(), jwt, issuer.server.URL, testAudience, stale.Add(time.Second)); err != nil {
+			rejected = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !rejected {
+		t.Fatal("token signed by revoked key still verifies after background refresh")
+	}
+
+	// The replacement key verifies from the refreshed cache with no extra fetch.
+	fresh := signJWT(t, newKey, keyID(1), issuer.server.URL, testAudience, stale)
+	if _, err := v.Verify(context.Background(), fresh, issuer.server.URL, testAudience, stale.Add(time.Second)); err != nil {
+		t.Fatalf("Verify with rotated key after refresh: %v", err)
+	}
+	if got := issuer.fetches.Load(); got != 2 {
+		t.Errorf("issuer fetched %d times, want 2 (new key served from refreshed cache)", got)
 	}
 }
 
