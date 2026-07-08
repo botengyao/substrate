@@ -119,22 +119,27 @@ var (
 )
 
 // keyRefetchInterval is the minimum time between key fetches for a single
-// issuer. The key ID that triggers a refetch comes from an unverified token,
+// issuer. The keyID that triggers a refetch comes from an unverified token,
 // so without this floor a client could force an OIDC discovery round-trip per
-// request just by minting tokens with bogus key IDs.
+// request just by minting tokens with bogus keyIDs.
 const keyRefetchInterval = 10 * time.Second
 
-// Verifier verifies Kubernetes JWTs, caching each issuer's verification keys
-// in memory. Keys are fetched on first use and refetched only when a JWT
-// presents an unknown key ID (i.e. on key rotation), rate-limited to one
+// CachedVerifier verifies Kubernetes JWTs, caching each issuer's verification
+// keys in memory. Keys are fetched on first use and refetched only when a JWT
+// presents an unknown keyID (i.e. on key rotation), rate-limited to one
 // fetch per issuer per keyRefetchInterval.
-type Verifier struct {
+type CachedVerifier struct {
 	httpClient *http.Client
 
 	// flight coalesces concurrent key fetches for the same issuer.
 	flight singleflight.Group
 
-	mu      sync.Mutex
+	mu sync.Mutex
+	// issuers holds one entry per issuer that has been used for verification.
+	// Its size is bounded by the number of distinct trusted issuers the
+	// process is configured with (in practice one): Verify rejects tokens
+	// whose issuer differs from expectedIssuer before consulting the cache,
+	// so unverified traffic cannot create entries.
 	issuers map[string]*issuerKeys
 }
 
@@ -143,18 +148,21 @@ type issuerKeys struct {
 	lastFetch time.Time
 }
 
-// NewVerifier creates a Verifier. httpClient is used for OIDC discovery and
-// JWKS fetches; nil uses a default client with a whole-request timeout.
-func NewVerifier(httpClient *http.Client) *Verifier {
-	return &Verifier{
+// NewCachedVerifier creates a CachedVerifier. httpClient is used for OIDC
+// discovery and JWKS fetches; nil uses a default client with a whole-request
+// timeout.
+func NewCachedVerifier(httpClient *http.Client) *CachedVerifier {
+	return &CachedVerifier{
 		httpClient: httpClient,
 		issuers:    make(map[string]*issuerKeys),
 	}
 }
 
-// keyForIssuer returns the issuer's verification key with the given key ID,
-// (re)fetching the issuer's keys if the key ID is not already cached.
-func (v *Verifier) keyForIssuer(ctx context.Context, issuer, keyID string, now time.Time) (crypto.PublicKey, error) {
+// keyForIssuer returns the issuer's verification key with the given keyID,
+// (re)fetching the issuer's keys if the keyID is not already cached.
+func (v *CachedVerifier) keyForIssuer(ctx context.Context, issuer, keyID string, now time.Time) (crypto.PublicKey, error) {
+	// Can't defer Unlock(): the lock must be dropped before the network fetch
+	// below and re-taken afterwards, so it is managed manually at each return.
 	v.mu.Lock()
 	state, ok := v.issuers[issuer]
 	if !ok {
@@ -165,10 +173,10 @@ func (v *Verifier) keyForIssuer(ctx context.Context, issuer, keyID string, now t
 		v.mu.Unlock()
 		return key.PublicKey, nil
 	}
-	throttled := !state.lastFetch.IsZero() && now.Sub(state.lastFetch) < keyRefetchInterval
+	lastFetch := state.lastFetch
 	v.mu.Unlock()
-	if throttled {
-		return nil, fmt.Errorf("unknown key ID %q", keyID)
+	if !lastFetch.IsZero() && now.Sub(lastFetch) < keyRefetchInterval {
+		return nil, fmt.Errorf("keyID %q not found in cache, refetch throttled, last fetch was at %v", keyID, lastFetch)
 	}
 
 	_, err, _ := v.flight.Do(issuer, func() (any, error) {
@@ -185,14 +193,14 @@ func (v *Verifier) keyForIssuer(ctx context.Context, issuer, keyID string, now t
 		return nil, nil
 	})
 	if err != nil {
-		return nil, fmt.Errorf("while discovering keys from issuer: %w", err)
+		return nil, fmt.Errorf("while discovering keys from issuer for keyID %q: %w", keyID, err)
 	}
 
 	v.mu.Lock()
 	key := findKey(state.keys, keyID)
 	v.mu.Unlock()
 	if key == nil {
-		return nil, fmt.Errorf("unknown key ID %q", keyID)
+		return nil, fmt.Errorf("unknown keyID %q", keyID)
 	}
 	return key.PublicKey, nil
 }
@@ -214,7 +222,7 @@ func findKey(keys []*KeyAndID, keyID string) *KeyAndID {
 // the object binding claims. If needed for your use case, you will need check the object bindings
 // by connecting to the cluster and seeing if the object(s) the bindings name still exist within the
 // cluster.
-func (v *Verifier) Verify(ctx context.Context, jwt string, expectedIssuer, expectedAudience string, now time.Time) (*KubernetesClaims, error) {
+func (v *CachedVerifier) Verify(ctx context.Context, jwt string, expectedIssuer, expectedAudience string, now time.Time) (*KubernetesClaims, error) {
 	segments := strings.Split(jwt, ".")
 	if len(segments) != 3 {
 		return nil, fmt.Errorf("malformed JWT")
@@ -263,9 +271,9 @@ func (v *Verifier) Verify(ctx context.Context, jwt string, expectedIssuer, expec
 		return nil, fmt.Errorf("unexpected issuer %q", rawClaims.Issuer)
 	}
 
-	// Find the key we should use for verification based on the key ID in the JWT header.
+	// Find the key we should use for verification based on the keyID in the JWT header.
 	if header.KeyID == "" {
-		return nil, fmt.Errorf("key ID is required")
+		return nil, fmt.Errorf("keyID is required")
 	}
 	selectedKey, err := v.keyForIssuer(ctx, rawClaims.Issuer, header.KeyID, now)
 	if err != nil {

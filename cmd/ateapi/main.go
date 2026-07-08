@@ -160,7 +160,7 @@ func main() {
 
 	// One verifier shared by the auth interceptor and the session-identity
 	// service, so they share the issuer's cached verification keys.
-	jwtVerifier := k8sjwt.NewVerifier(jwtIssuerDiscoveryClient)
+	jwtVerifier := k8sjwt.NewCachedVerifier(jwtIssuerDiscoveryClient)
 
 	sessionIdentitySrv := sessionidentity.New(*clientJWTIssuer, *clientJWTAudience, *sessionIDJWTPoolFile, *sessionIDCAPoolFile, *workerpoolCACerts, jwtVerifier)
 

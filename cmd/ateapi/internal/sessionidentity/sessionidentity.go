@@ -51,12 +51,12 @@ type Server struct {
 	sessionIDCAPoolFile  string
 
 	workerCACerts string
-	verifier      *k8sjwt.Verifier
+	verifier      *k8sjwt.CachedVerifier
 }
 
 var _ ateapipb.SessionIdentityServer = (*Server)(nil)
 
-func New(clientJWTIssuer, clientJWTAudience, sessionIDJWTPoolFile, sessionIDCAPoolFile, workerCACerts string, verifier *k8sjwt.Verifier) *Server {
+func New(clientJWTIssuer, clientJWTAudience, sessionIDJWTPoolFile, sessionIDCAPoolFile, workerCACerts string, verifier *k8sjwt.CachedVerifier) *Server {
 	return &Server{
 		clientJWTIssuer:      clientJWTIssuer,
 		clientJWTAudience:    clientJWTAudience,

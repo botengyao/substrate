@@ -126,13 +126,13 @@ func signJWT(t *testing.T, key *rsa.PrivateKey, kid, issuer, audience string, no
 	return toBeSigned + "." + base64.RawURLEncoding.EncodeToString(signature)
 }
 
-func TestVerifier_ValidToken(t *testing.T) {
+func TestCachedVerifier_ValidToken(t *testing.T) {
 	issuer := newFakeIssuer(t)
 	key := generateKey(t)
 	issuer.setKeys(t, key)
 	now := time.Now()
 
-	v := NewVerifier(nil)
+	v := NewCachedVerifier(nil)
 	jwt := signJWT(t, key, keyID(0), issuer.server.URL, testAudience, now)
 	claims, err := v.Verify(context.Background(), jwt, issuer.server.URL, testAudience, now)
 	if err != nil {
@@ -143,13 +143,13 @@ func TestVerifier_ValidToken(t *testing.T) {
 	}
 }
 
-func TestVerifier_CachesKeysAcrossRequests(t *testing.T) {
+func TestCachedVerifier_CachesKeysAcrossRequests(t *testing.T) {
 	issuer := newFakeIssuer(t)
 	key := generateKey(t)
 	issuer.setKeys(t, key)
 	now := time.Now()
 
-	v := NewVerifier(nil)
+	v := NewCachedVerifier(nil)
 	for i := range 5 {
 		jwt := signJWT(t, key, keyID(0), issuer.server.URL, testAudience, now)
 		if _, err := v.Verify(context.Background(), jwt, issuer.server.URL, testAudience, now); err != nil {
@@ -161,13 +161,13 @@ func TestVerifier_CachesKeysAcrossRequests(t *testing.T) {
 	}
 }
 
-func TestVerifier_RefetchesOnKeyRotation(t *testing.T) {
+func TestCachedVerifier_RefetchesOnKeyRotation(t *testing.T) {
 	issuer := newFakeIssuer(t)
 	oldKey := generateKey(t)
 	issuer.setKeys(t, oldKey)
 	now := time.Now()
 
-	v := NewVerifier(nil)
+	v := NewCachedVerifier(nil)
 	jwt := signJWT(t, oldKey, keyID(0), issuer.server.URL, testAudience, now)
 	if _, err := v.Verify(context.Background(), jwt, issuer.server.URL, testAudience, now); err != nil {
 		t.Fatalf("Verify with old key: %v", err)
@@ -186,25 +186,25 @@ func TestVerifier_RefetchesOnKeyRotation(t *testing.T) {
 	}
 }
 
-func TestVerifier_UnknownKeyIDRefetchIsThrottled(t *testing.T) {
+func TestCachedVerifier_UnknownKeyIDRefetchIsThrottled(t *testing.T) {
 	issuer := newFakeIssuer(t)
 	key := generateKey(t)
 	issuer.setKeys(t, key)
 	now := time.Now()
 
-	v := NewVerifier(nil)
+	v := NewCachedVerifier(nil)
 	jwt := signJWT(t, key, keyID(0), issuer.server.URL, testAudience, now)
 	if _, err := v.Verify(context.Background(), jwt, issuer.server.URL, testAudience, now); err != nil {
 		t.Fatalf("Verify: %v", err)
 	}
 
-	// A burst of tokens with a bogus key ID must not cause a fetch per
+	// A burst of tokens with a bogus keyID must not cause a fetch per
 	// request: within the throttle window they fail without refetching.
 	bogus := signJWT(t, key, "no-such-kid", issuer.server.URL, testAudience, now)
 	for range 5 {
 		soon := now.Add(time.Second)
 		if _, err := v.Verify(context.Background(), bogus, issuer.server.URL, testAudience, soon); err == nil {
-			t.Fatal("Verify with bogus key ID unexpectedly succeeded")
+			t.Fatal("Verify with bogus keyID unexpectedly succeeded")
 		}
 	}
 	if got := issuer.fetches.Load(); got != 1 {
@@ -214,20 +214,20 @@ func TestVerifier_UnknownKeyIDRefetchIsThrottled(t *testing.T) {
 	// Once the window passes, one refetch happens (and still fails).
 	later := now.Add(keyRefetchInterval + time.Second)
 	if _, err := v.Verify(context.Background(), bogus, issuer.server.URL, testAudience, later); err == nil {
-		t.Fatal("Verify with bogus key ID unexpectedly succeeded")
+		t.Fatal("Verify with bogus keyID unexpectedly succeeded")
 	}
 	if got := issuer.fetches.Load(); got != 2 {
 		t.Errorf("issuer fetched %d times after throttle window, want 2", got)
 	}
 }
 
-func TestVerifier_RejectsBadSignature(t *testing.T) {
+func TestCachedVerifier_RejectsBadSignature(t *testing.T) {
 	issuer := newFakeIssuer(t)
 	key := generateKey(t)
 	issuer.setKeys(t, key)
 	now := time.Now()
 
-	v := NewVerifier(nil)
+	v := NewCachedVerifier(nil)
 	// Signed by an unrelated key but claiming the served key's ID.
 	jwt := signJWT(t, generateKey(t), keyID(0), issuer.server.URL, testAudience, now)
 	if _, err := v.Verify(context.Background(), jwt, issuer.server.URL, testAudience, now); err == nil {
@@ -235,13 +235,13 @@ func TestVerifier_RejectsBadSignature(t *testing.T) {
 	}
 }
 
-func TestVerifier_RejectsWrongAudience(t *testing.T) {
+func TestCachedVerifier_RejectsWrongAudience(t *testing.T) {
 	issuer := newFakeIssuer(t)
 	key := generateKey(t)
 	issuer.setKeys(t, key)
 	now := time.Now()
 
-	v := NewVerifier(nil)
+	v := NewCachedVerifier(nil)
 	jwt := signJWT(t, key, keyID(0), issuer.server.URL, "other-audience", now)
 	_, err := v.Verify(context.Background(), jwt, issuer.server.URL, testAudience, now)
 	if err == nil || !strings.Contains(err.Error(), "audience") {
